@@ -35,7 +35,32 @@ The fresh state used by :func:`apply_blocks` and :func:`agc_batch` is
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Sequence
+
+_MINUS_INF = float("-inf")
+
+
+def _to_float(value: Any) -> float | None:
+    """Best-effort numeric conversion used by :func:`validate`."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _close(a: float, b: float, tol: float = 1e-9) -> bool:
+    """Compare two floats, treating identical infinities as equal."""
+
+    if a == b:
+        return True
+    try:
+        return abs(a - b) <= tol
+    except (TypeError, ValueError):
+        return False
 
 
 def rms_db(samples: Sequence[float]) -> float:
@@ -47,7 +72,13 @@ def rms_db(samples: Sequence[float]) -> float:
     normalization is applied.
     """
 
-    raise NotImplementedError
+    values = list(samples)
+    if not values:
+        return _MINUS_INF
+    mean_square = sum(float(x) * float(x) for x in values) / len(values)
+    if mean_square <= 0.0:
+        return _MINUS_INF
+    return 20.0 * math.log10(math.sqrt(mean_square))
 
 
 def noise_floor(levels: Sequence[float], percentile: float) -> float:
@@ -62,7 +93,18 @@ def noise_floor(levels: Sequence[float], percentile: float) -> float:
     occasional loud speech blocks: it is a percentile, not the arithmetic mean.
     """
 
-    raise NotImplementedError
+    ordered = sorted(float(level) for level in levels)
+    count = len(ordered)
+    if count == 0:
+        return _MINUS_INF
+
+    pct = min(100.0, max(0.0, float(percentile)))
+    if pct >= 100.0:
+        index = count - 1
+    else:
+        index = max(0, math.ceil(pct / 100.0 * count) - 1)
+        index = min(index, count - 1)
+    return ordered[index]
 
 
 def target_gain(
@@ -81,7 +123,10 @@ def target_gain(
     ``max_gain`` is measured in dB.
     """
 
-    raise NotImplementedError
+    reference = max(float(level), float(floor))
+    raw = float(target_db) - reference
+    ceiling = max(0.0, float(max_gain))
+    return min(ceiling, max(0.0, raw))
 
 
 def smooth(
@@ -108,7 +153,36 @@ def smooth(
     block of that total duration (within ``1e-9``).
     """
 
-    raise NotImplementedError
+    gain = float(gain)
+    prev = float(prev)
+    if gain == prev:
+        return prev
+
+    tau = float(attack_ms) if gain < prev else float(release_ms)
+    duration = max(0.0, float(block_ms))
+    if tau <= 0.0:
+        # Degenerate time constant: the filter tracks the target immediately.
+        return gain
+    alpha = 1.0 - math.exp(-duration / tau)
+    return prev + alpha * (gain - prev)
+
+
+
+def _fresh_state() -> dict[str, Any]:
+    """Return a brand-new state mapping (no shared mutable containers)."""
+
+    return {"prev_gain": 0.0, "floor_db": -100.0, "levels": []}
+
+
+def _copy_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Shallow-copy a state mapping, duplicating the level history."""
+
+    levels = state.get("levels", [])
+    return {
+        "prev_gain": float(state.get("prev_gain", 0.0)),
+        "floor_db": float(state.get("floor_db", -100.0)),
+        "levels": [float(level) for level in levels],
+    }
 
 
 def process_block(
@@ -139,7 +213,47 @@ def process_block(
     floor, and history.  The caller's ``state`` must not be mutated.
     """
 
-    raise NotImplementedError
+    values = [float(sample) for sample in samples]
+
+    # Measure first: an empty or all-zero block yields -inf, i.e. digital
+    # silence, which holds the state.
+    level = rms_db(values)
+    if level == _MINUS_INF:
+        return [0.0] * len(values), _copy_state(state)
+
+    sample_rate = float(config["sample_rate"])
+    block_ms = 1000.0 * len(values) / sample_rate
+
+    floor_window = int(config["floor_window"])
+    levels = [float(entry) for entry in state.get("levels", [])]
+    levels.append(level)
+    if floor_window > 0:
+        levels = levels[-floor_window:]
+
+    floor_db = noise_floor(levels, float(config["noise_percentile"]))
+    desired = target_gain(
+        level,
+        floor_db,
+        float(config["target_db"]),
+        float(config["max_gain"]),
+    )
+    gain_db = smooth(
+        desired,
+        float(state.get("prev_gain", 0.0)),
+        float(config["attack_ms"]),
+        float(config["release_ms"]),
+        block_ms,
+    )
+
+    multiplier = 10.0 ** (gain_db / 20.0)
+    output = [sample * multiplier for sample in values]
+
+    new_state = {
+        "prev_gain": gain_db,
+        "floor_db": floor_db,
+        "levels": levels,
+    }
+    return output, new_state
 
 
 def apply_blocks(
@@ -156,7 +270,22 @@ def apply_blocks(
     calling :func:`process_block` sequentially with the returned state.
     """
 
-    raise NotImplementedError
+    if isinstance(block, bool) or not isinstance(block, int):
+        raise TypeError("block must be a positive integer")
+    if block <= 0:
+        raise ValueError("block must be a positive integer")
+
+    values = list(samples)
+    state = _fresh_state()
+    output: list[float] = []
+
+    # range() stops after the final partial block, which is processed too.
+    for start in range(0, len(values), block):
+        chunk = values[start : start + block]
+        chunk_output, state = process_block(chunk, state, config)
+        output.extend(chunk_output)
+
+    return output
 
 
 def validate(
@@ -182,7 +311,101 @@ def validate(
     non-empty list rather than being silently accepted.
     """
 
-    raise NotImplementedError
+    problems: list[str] = []
+
+    max_gain = _to_float(config.get("max_gain", 0.0))
+    target_db = _to_float(config.get("target_db", 0.0))
+
+    # -- prev_gain -----------------------------------------------------
+    prev_gain = _to_float(state.get("prev_gain"))
+    if prev_gain is None or not math.isfinite(prev_gain):
+        problems.append("prev_gain must be a finite dB value")
+    else:
+        if prev_gain < 0.0:
+            problems.append(f"prev_gain {prev_gain} is below 0 dB")
+        if max_gain is None or not math.isfinite(max_gain) or max_gain < 0.0:
+            problems.append("max_gain must be a finite, non-negative dB value")
+        elif prev_gain > max_gain + 1e-9:
+            problems.append(
+                f"prev_gain {prev_gain} exceeds max_gain {max_gain}"
+            )
+
+    # -- floor_db ------------------------------------------------------
+    floor_db = _to_float(state.get("floor_db"))
+    if floor_db is None or math.isnan(floor_db):
+        problems.append("floor_db must not be NaN")
+    elif floor_db > 0.0:
+        problems.append(f"floor_db {floor_db} is above 0 dBFS")
+
+    # -- timing / window configuration --------------------------------
+    attack_ms = _to_float(config.get("attack_ms"))
+    release_ms = _to_float(config.get("release_ms"))
+    if attack_ms is None or not math.isfinite(attack_ms) or attack_ms <= 0.0:
+        problems.append("attack_ms must be finite and > 0")
+    if (
+        release_ms is None
+        or not math.isfinite(release_ms)
+        or release_ms <= 0.0
+    ):
+        problems.append("release_ms must be finite and > 0")
+    if (
+        attack_ms is not None
+        and release_ms is not None
+        and math.isfinite(attack_ms)
+        and math.isfinite(release_ms)
+        and attack_ms > release_ms
+    ):
+        problems.append("attack_ms must not exceed release_ms")
+
+    floor_window = config.get("floor_window")
+    if (
+        isinstance(floor_window, bool)
+        or not isinstance(floor_window, int)
+        or floor_window < 1
+    ):
+        problems.append("floor_window must be a positive integer")
+
+    # -- gain / floor self-consistency --------------------------------
+    tolerance = _to_float(config.get("consistency_tol_db", 0.5))
+    if tolerance is None or tolerance < 0.0:
+        tolerance = 0.5
+    if (
+        prev_gain is not None
+        and math.isfinite(prev_gain)
+        and prev_gain > 0.0
+        and floor_db is not None
+        and math.isfinite(floor_db)
+        and target_db is not None
+        and math.isfinite(target_db)
+    ):
+        expected = target_db - floor_db
+        if abs(prev_gain - expected) > tolerance:
+            problems.append(
+                "prev_gain is inconsistent with target_db - floor_db "
+                f"({prev_gain} vs {expected})"
+            )
+
+    # -- tracked floor matches the retained level history -------------
+    levels = state.get("levels", [])
+    if levels:
+        history = [float(level) for level in levels]
+        if (
+            not isinstance(floor_window, bool)
+            and isinstance(floor_window, int)
+            and floor_window > 0
+        ):
+            history = history[-floor_window:]
+        percentile = _to_float(config.get("noise_percentile", 20.0))
+        if percentile is None:
+            percentile = 20.0
+        expected_floor = noise_floor(history, percentile)
+        if floor_db is None or not _close(floor_db, expected_floor, 1e-9):
+            problems.append(
+                "floor_db does not match the tracked level history "
+                f"({floor_db} vs {expected_floor})"
+            )
+
+    return problems
 
 
 def agc_batch(
@@ -199,4 +422,9 @@ def agc_batch(
     as their input track.
     """
 
-    raise NotImplementedError
+    block = config["block"]
+    return {
+        name: apply_blocks(samples, config, block)
+        for name, samples in tracks.items()
+    }
+
